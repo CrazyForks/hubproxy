@@ -6,7 +6,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -32,22 +31,9 @@ func serveEmbedFile(c *gin.Context, filename string) {
 }
 
 var (
-	exps = []*regexp.Regexp{
-		regexp.MustCompile(`^(?:https?://)?github\.com/([^/]+)/([^/]+)/(?:releases|archive)/.*$`),
-		regexp.MustCompile(`^(?:https?://)?github\.com/([^/]+)/([^/]+)/(?:blob|raw)/.*$`),
-		regexp.MustCompile(`^(?:https?://)?github\.com/([^/]+)/([^/]+)/(?:info|git-).*$`),
-		regexp.MustCompile(`^(?:https?://)?raw\.github(?:usercontent|)\.com/([^/]+)/([^/]+)/.+?/.+$`),
-		regexp.MustCompile(`^(?:https?://)?gist\.github(?:usercontent|)\.com/([^/]+)/.+?/.+`),
-		regexp.MustCompile(`^(?:https?://)?api\.github\.com/repos/([^/]+)/([^/]+)/.*`),
-		regexp.MustCompile(`^(?:https?://)?huggingface\.co(?:/spaces)?/([^/]+)/(.+)$`),
-		regexp.MustCompile(`^(?:https?://)?cdn-lfs\.hf\.co(?:/spaces)?/([^/]+)/([^/]+)(?:/(.*))?$`),
-		regexp.MustCompile(`^(?:https?://)?download\.docker\.com/([^/]+)/.*\.(tgz|zip)$`),
-		regexp.MustCompile(`^(?:https?://)?(github|opengraph)\.githubassets\.com/([^/]+)/.+?$`),
-	}
-	globalLimiter *IPRateLimiter
-
-	// 服务启动时间
-	serviceStartTime = time.Now()
+	   globalLimiter *IPRateLimiter
+	   // 服务启动时间
+	   serviceStartTime = time.Now()
 )
 
 func main() {
@@ -138,10 +124,15 @@ func main() {
 }
 
 func handler(c *gin.Context) {
+	// 去除前导斜杠
 	rawPath := strings.TrimPrefix(c.Request.URL.RequestURI(), "/")
-
 	for strings.HasPrefix(rawPath, "/") {
 		rawPath = strings.TrimPrefix(rawPath, "/")
+	}
+
+	// 自动补全协议头
+	if !strings.HasPrefix(rawPath, "http://") && !strings.HasPrefix(rawPath, "https://") {
+		rawPath = "https://" + rawPath
 	}
 
 	if !strings.HasPrefix(rawPath, "http") {
@@ -149,31 +140,26 @@ func handler(c *gin.Context) {
 		return
 	}
 
-	matches := checkURL(rawPath)
-	if matches != nil {
-		// GitHub仓库访问控制检查
-		if allowed, reason := GlobalAccessController.CheckGitHubAccess(matches); !allowed {
-			// 构建仓库名用于日志
-			var repoPath string
-			if len(matches) >= 2 {
-				username := matches[0]
-				repoName := strings.TrimSuffix(matches[1], ".git")
-				repoPath = username + "/" + repoName
-			}
-			fmt.Printf("GitHub仓库 %s 访问被拒绝: %s\n", repoPath, reason)
-			c.String(http.StatusForbidden, reason)
-			return
-		}
-	} else {
-		c.String(http.StatusForbidden, "无效输入")
-		return
-	}
+	   matchResult, ok := MatchURL(rawPath)
+	   if ok {
+			   // GitHub仓库访问控制检查
+			   if allowed, reason := GlobalAccessController.CheckGitHubAccess([]string{matchResult.Owner, matchResult.Repo}); !allowed {
+					   repoPath := matchResult.Owner + "/" + matchResult.Repo
+					   fmt.Printf("GitHub仓库 %s 访问被拒绝: %s\n", repoPath, reason)
+					   c.String(http.StatusForbidden, reason)
+					   return
+			   }
+	   } else {
+			   c.String(http.StatusForbidden, "无效输入")
+			   return
+	   }
 
-	if exps[1].MatchString(rawPath) {
-		rawPath = strings.Replace(rawPath, "/blob/", "/raw/", 1)
-	}
+	   // 保持与原有逻辑一致，处理 /blob/ -> /raw/ 的特殊情况
+	   if strings.Contains(rawPath, "/blob/") {
+			   rawPath = strings.Replace(rawPath, "/blob/", "/raw/", 1)
+	   }
 
-	proxyRequest(c, rawPath)
+	   proxyRequest(c, rawPath)
 }
 
 func proxyRequest(c *gin.Context, u string) {
@@ -260,14 +246,14 @@ func proxyWithRedirect(c *gin.Context, u string, redirectCount int) {
 			}
 		}
 
-		if location := resp.Header.Get("Location"); location != "" {
-			if checkURL(location) != nil {
-				c.Header("Location", "/"+location)
-			} else {
-				proxyWithRedirect(c, location, redirectCount+1)
-				return
-			}
-		}
+			   if location := resp.Header.Get("Location"); location != "" {
+					   if _, ok := MatchURL(location); ok {
+							   c.Header("Location", "/"+location)
+					   } else {
+							   proxyWithRedirect(c, location, redirectCount+1)
+							   return
+					   }
+			   }
 
 		c.Status(resp.StatusCode)
 
@@ -283,14 +269,14 @@ func proxyWithRedirect(c *gin.Context, u string, redirectCount int) {
 		}
 
 		// 处理重定向
-		if location := resp.Header.Get("Location"); location != "" {
-			if checkURL(location) != nil {
-				c.Header("Location", "/"+location)
-			} else {
-				proxyWithRedirect(c, location, redirectCount+1)
-				return
-			}
-		}
+			   if location := resp.Header.Get("Location"); location != "" {
+					   if _, ok := MatchURL(location); ok {
+							   c.Header("Location", "/"+location)
+					   } else {
+							   proxyWithRedirect(c, location, redirectCount+1)
+							   return
+					   }
+			   }
 
 		c.Status(resp.StatusCode)
 
@@ -299,81 +285,23 @@ func proxyWithRedirect(c *gin.Context, u string, redirectCount int) {
 	}
 }
 
-func checkURL(u string) []string {
-	for _, exp := range exps {
-		if matches := exp.FindStringSubmatch(u); matches != nil {
-			return matches[1:]
-		}
-	}
-	return nil
-}
 
-// 初始化健康监控路由
+
+// 简单的健康检查
 func initHealthRoutes(router *gin.Engine) {
-	// 健康检查端点
-	router.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{
-			"status":    "healthy",
-			"timestamp": time.Now().Unix(),
-			"uptime":    time.Since(serviceStartTime).Seconds(),
-			"service":   "hubproxy",
-		})
-	})
-
-	// 就绪检查端点
-	router.GET("/ready", func(c *gin.Context) {
-		checks := make(map[string]string)
-		allReady := true
-
-		if GetConfig() != nil {
-			checks["config"] = "ok"
-		} else {
-			checks["config"] = "failed"
-			allReady = false
-		}
-
-		// 检查全局缓存状态
-		if globalCache != nil {
-			checks["cache"] = "ok"
-		} else {
-			checks["cache"] = "failed"
-			allReady = false
-		}
-
-		// 检查限流器状态
-		if globalLimiter != nil {
-			checks["ratelimiter"] = "ok"
-		} else {
-			checks["ratelimiter"] = "failed"
-			allReady = false
-		}
-
-		// 检查镜像下载器状态
-		if globalImageStreamer != nil {
-			checks["imagestreamer"] = "ok"
-		} else {
-			checks["imagestreamer"] = "failed"
-			allReady = false
-		}
-
-		// 检查HTTP客户端状态
-		if GetGlobalHTTPClient() != nil {
-			checks["httpclient"] = "ok"
-		} else {
-			checks["httpclient"] = "failed"
-			allReady = false
-		}
-
-		status := http.StatusOK
-		if !allReady {
-			status = http.StatusServiceUnavailable
-		}
-
-		c.JSON(status, gin.H{
-			"ready":     allReady,
-			"checks":    checks,
-			"timestamp": time.Now().Unix(),
-			"uptime":    time.Since(serviceStartTime).Seconds(),
-		})
-	})
+	   router.GET("/health", func(c *gin.Context) {
+			   c.JSON(http.StatusOK, gin.H{
+					   "status":    "healthy",
+					   "timestamp": time.Now().Unix(),
+					   "uptime":    time.Since(serviceStartTime).Seconds(),
+					   "service":   "hubproxy",
+			   })
+	   })
+	   router.GET("/ready", func(c *gin.Context) {
+			   c.JSON(http.StatusOK, gin.H{
+					   "ready":     true,
+					   "timestamp": time.Now().Unix(),
+					   "uptime":    time.Since(serviceStartTime).Seconds(),
+			   })
+	   })
 }
